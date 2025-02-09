@@ -1,7 +1,7 @@
 mod client;
 
+pub use client::{config, connect, connect_with_config, Client, ServerRx};
 pub use openai_realtime_types as types;
-pub use client::{connect, Client, ServerRx};
 
 #[cfg(feature = "utils")]
 pub use openai_realtime_utils as utils;

@@ -44,7 +44,7 @@ impl Config {
         Self {
             base_url: "wss://api.openai.com/v1".to_string(),
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "".to_string()).into(),
-            model: "gpt-4o-realtime-preview-2024-10-01".to_string(),
+            model: "gpt-4o-realtime-preview-2024-12-17".to_string(),
         }
     }
     

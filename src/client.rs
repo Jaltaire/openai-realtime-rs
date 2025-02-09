@@ -1,15 +1,15 @@
-use std::sync::{Arc, Mutex};
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message;
-use openai_realtime_types::audio::Base64EncodedAudioBytes;
-use openai_realtime_types::session::Session;
 use crate::client::stats::Stats;
 use crate::types;
+use futures_util::{SinkExt, StreamExt};
+use openai_realtime_types::audio::Base64EncodedAudioBytes;
+use openai_realtime_types::session::Session;
+use std::sync::{Arc, Mutex};
+use tokio_tungstenite::tungstenite::Message;
 
+pub mod config;
 mod consts;
-mod config;
-mod utils;
 mod stats;
+mod utils;
 
 pub type ClientTx = tokio::sync::mpsc::Sender<types::ClientEvent>;
 type ServerTx = tokio::sync::broadcast::Sender<types::ServerEvent>;
@@ -20,7 +20,7 @@ pub struct Client {
     config: config::Config,
     c_tx: Option<ClientTx>,
     s_tx: Option<ServerTx>,
-    stats: Arc<Mutex<Stats>>
+    stats: Arc<Mutex<Stats>>,
 }
 
 impl Client {
@@ -80,7 +80,11 @@ impl Client {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                             let event_type = json.get("type").map(|v| v.as_str()).flatten();
                             let event_id = json.get("event_id").map(|v| v.as_str()).flatten();
-                            tracing::debug!("received message: {}, id={}", event_type.unwrap_or("unknown"), event_id.unwrap_or("unknown"));
+                            tracing::debug!(
+                                "received message: {}, id={}",
+                                event_type.unwrap_or("unknown"),
+                                event_id.unwrap_or("unknown")
+                            );
                         }
 
                         match serde_json::from_str::<types::ServerEvent>(&text) {
@@ -96,21 +100,39 @@ impl Client {
                                         let output_tokens = usage.output_tokens();
 
                                         if let Ok(mut stats_guard) = stats.lock() {
-                                            stats_guard.update_usage(total_tokens, input_tokens, output_tokens);
+                                            stats_guard.update_usage(
+                                                total_tokens,
+                                                input_tokens,
+                                                output_tokens,
+                                            );
                                         } else {
                                             tracing::error!("failed to update stats");
                                         }
 
-                                        tracing::debug!("total_tokens: {}, input_tokens: {}, output_tokens: {}", total_tokens, input_tokens, output_tokens);
+                                        tracing::debug!(
+                                            "total_tokens: {}, input_tokens: {}, output_tokens: {}",
+                                            total_tokens,
+                                            input_tokens,
+                                            output_tokens
+                                        );
                                     }
                                 }
                             }
                             Err(e) => {
                                 let json = serde_json::from_str::<serde_json::Value>(&text);
                                 json.map(|json| {
-                                    tracing::error!("failed to deserialize event: {}, type=> {:?}", e, json);
-                                }).unwrap_or_else(|_| {
-                                    tracing::error!("failed to deserialize event: {}, text=> {:?}", e, text);
+                                    tracing::error!(
+                                        "failed to deserialize event: {}, type=> {:?}",
+                                        e,
+                                        json
+                                    );
+                                })
+                                .unwrap_or_else(|_| {
+                                    tracing::error!(
+                                        "failed to deserialize event: {}, text=> {:?}",
+                                        e,
+                                        text
+                                    );
                                 });
                                 // tracing::error!("failed to deserialize event: {}, text=> {:?}", e, json);
                             }
@@ -128,7 +150,7 @@ impl Client {
                             tracing::error!("failed to send close event: {}", e);
                         }
                         break;
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -152,8 +174,11 @@ impl Client {
             Err("failed to get stats".into())
         }
     }
-    
-    async fn send_client_event(&mut self, event: types::ClientEvent) -> Result<(), Box<dyn std::error::Error>> {
+
+    async fn send_client_event(
+        &mut self,
+        event: types::ClientEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match self.c_tx {
             Some(ref tx) => {
                 tx.send(event).await?;
@@ -163,33 +188,57 @@ impl Client {
         }
     }
 
-    pub async fn update_session(&mut self, config: Session) -> Result<(), Box<dyn std::error::Error>> {
-        let event = types::ClientEvent::SessionUpdate(types::events::client::SessionUpdateEvent::new(config));
+    pub async fn update_session(
+        &mut self,
+        config: Session,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = types::ClientEvent::SessionUpdate(
+            types::events::client::SessionUpdateEvent::new(config),
+        );
         self.send_client_event(event).await
     }
-    
-    pub async fn append_input_audio_buffer(&mut self, audio: Base64EncodedAudioBytes) -> Result<(), Box<dyn std::error::Error>> {
-        let event = types::ClientEvent::InputAudioBufferAppend(types::events::client::InputAudioBufferAppendEvent::new(audio));
+
+    pub async fn append_input_audio_buffer(
+        &mut self,
+        audio: Base64EncodedAudioBytes,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = types::ClientEvent::InputAudioBufferAppend(
+            types::events::client::InputAudioBufferAppendEvent::new(audio),
+        );
         self.send_client_event(event).await
     }
-    
-    pub async fn create_conversation_item(&mut self, item: types::Item) -> Result<(), Box<dyn std::error::Error>> {
-        let event = types::ClientEvent::ConversationItemCreate(types::events::client::ConversationItemCreateEvent::new(item));
+
+    pub async fn create_conversation_item(
+        &mut self,
+        item: types::Item,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = types::ClientEvent::ConversationItemCreate(
+            types::events::client::ConversationItemCreateEvent::new(item),
+        );
         self.send_client_event(event).await
     }
-    
+
     pub async fn create_response(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let event = types::ClientEvent::ResponseCreate(types::events::client::ResponseCreateEvent::new());
+        let event =
+            types::ClientEvent::ResponseCreate(types::events::client::ResponseCreateEvent::new());
         self.send_client_event(event).await
     }
-    
-    pub async fn create_response_with_config(&mut self, config: Session) -> Result<(), Box<dyn std::error::Error>> {
-        let event = types::ClientEvent::ResponseCreate(types::events::client::ResponseCreateEvent::new().with_update_session(config));
+
+    pub async fn create_response_with_config(
+        &mut self,
+        config: Session,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = types::ClientEvent::ResponseCreate(
+            types::events::client::ResponseCreateEvent::new().with_update_session(config),
+        );
         self.send_client_event(event).await
     }
 }
 
-pub async fn connect_with_config(capacity: usize, config: config::Config) -> Result<Client, Box<dyn std::error::Error>> {
+pub async fn connect_with_config(
+    capacity: usize,
+    config: config::Config,
+) -> Result<Client, Box<dyn std::error::Error>> {
     let mut client = Client::new(capacity, config);
     client.connect().await?;
     Ok(client)
