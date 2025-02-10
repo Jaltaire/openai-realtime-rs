@@ -1,17 +1,21 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FrameCount, StreamConfig};
-use openai_realtime_types::audio::Base64EncodedAudioBytes;
+use openai_realtime_types::audio::{
+    Base64EncodedAudioBytes, ServerVadTurnDetection, TurnDetection,
+};
 use openai_realtime_utils as utils;
 use openai_realtime_utils::audio::REALTIME_API_PCM16_SAMPLE_RATE;
 use ringbuf::traits::{Consumer, Producer, Split};
 use rubato::Resampler;
 use std::collections::VecDeque;
+use std::time::Instant;
 use tracing::Level;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
 const INPUT_CHUNK_SIZE: usize = 1024;
 const OUTPUT_CHUNK_SIZE: usize = 1024;
 const OUTPUT_LATENCY_MS: usize = 1000;
+const INTERRUPT_COOLDOWN_MS: u64 = 500;
 
 pub enum Input {
     Audio(Vec<f32>),
@@ -19,6 +23,7 @@ pub enum Input {
     Initialized(),
     AISpeaking(),
     AISpeakingDone(),
+    InterruptionDetected(),
 }
 
 #[tokio::main]
@@ -34,12 +39,7 @@ async fn main() {
 
     // Setup audio input device
     let input = utils::device::get_or_default_input(None).expect("failed to get input device");
-
     println!("input: {:?}", &input.name().unwrap());
-    input
-        .supported_input_configs()
-        .expect("failed to get supported input configs")
-        .for_each(|c| println!("supported input config: {:?}", c));
 
     let input_config = input
         .default_input_config()
@@ -56,6 +56,7 @@ async fn main() {
         &input.name().unwrap(),
         &input_config
     );
+
     let audio_input = input_tx.clone();
     let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
         let audio = if input_channel_count > 1 {
@@ -69,6 +70,7 @@ async fn main() {
             eprintln!("Failed to send audio data to buffer: {:?}", e);
         }
     };
+
     let input_stream = input
         .build_input_stream(
             &input_config,
@@ -78,17 +80,10 @@ async fn main() {
         )
         .expect("failed to build input stream");
     input_stream.play().expect("failed to play input stream");
-    let _input_channel_count = input_config.channels as usize;
     let input_sample_rate = input_config.sample_rate.0 as f32;
 
+    // Setup audio output device
     let output = utils::device::get_or_default_output(None).expect("failed to get output device");
-
-    println!("output: {:?}", &output.name().unwrap());
-    output
-        .supported_output_configs()
-        .expect("failed to get supported output configs")
-        .for_each(|c| println!("supported output config: {:?}", c));
-
     let output_config = output
         .default_output_config()
         .expect("failed to get default output config");
@@ -99,11 +94,6 @@ async fn main() {
     };
     let output_channel_count = output_config.channels as usize;
     let output_sample_rate = output_config.sample_rate.0 as f32;
-    println!(
-        "output: device={:?}, config={:?}",
-        &output.name().unwrap(),
-        &output_config
-    );
 
     let audio_out_buffer =
         utils::audio::shared_buffer(output_sample_rate as usize * OUTPUT_LATENCY_MS);
@@ -120,34 +110,29 @@ async fn main() {
                 silence += 1;
             }
 
-            // L channel (ch:0)
             if sample_index < data.len() {
                 data[sample_index] = sample;
                 sample_index += 1;
             }
-            // R channel (ch:1)
             if output_channel_count > 1 && sample_index < data.len() {
                 data[sample_index] = sample;
                 sample_index += 1;
             }
-
-            // ignore other channels
             sample_index += output_channel_count.saturating_sub(2);
         }
 
-        // println!("silence: {:?}", silence);
         let client_ctrl = client_ctrl.clone();
         if silence == (data.len() / output_channel_count) {
             if let Err(e) = client_ctrl.try_send(Input::AISpeakingDone()) {
                 eprintln!("Failed to send speaking done event to client: {:?}", e);
             }
         } else {
-            // println!("speaking..., silence: {:?}, len: {}", silence, data.len());
             if let Err(e) = client_ctrl.try_send(Input::AISpeaking()) {
                 eprintln!("Failed to send speaking event to client: {:?}", e);
             }
         }
     };
+
     let output_stream = output
         .build_output_stream(
             &output_config,
@@ -159,7 +144,7 @@ async fn main() {
 
     output_stream.play().expect("failed to play output stream");
 
-    // OpenAI Realtime API
+    // OpenAI Realtime API setup
     let mut realtime_api = openai_realtime::connect_with_config(
         1024,
         openai_realtime::config::ConfigBuilder::new()
@@ -203,7 +188,6 @@ async fn main() {
         .expect("failed to get server events");
     let server_handle = tokio::spawn(async move {
         while let Ok(e) = server_events.recv().await {
-            // println!("server_events: {:?}", &e);
             match e {
                 openai_realtime::types::events::ServerEvent::SessionCreated(data) => {
                     println!("session created: {:?}", data.session());
@@ -217,38 +201,22 @@ async fn main() {
                         eprintln!("Failed to send initialized event to client: {:?}", e);
                     }
                 }
-                // openai_realtime::types::events::ServerEvent::ConversationItemCreated(data) => {
-                //     println!("conversation item created: {:?}", data.item());
-                // }
                 openai_realtime::types::events::ServerEvent::InputAudioBufferSpeechStarted(data) => {
                     println!("speech started: {:?}", data);
-                }
-                openai_realtime::types::events::ServerEvent::InputAudioBufferSpeechStopped(data) => {
-                    println!("speech stopped: {:?}", data);
-                }
-                openai_realtime::types::events::ServerEvent::ConversationItemInputAudioTranscriptionCompleted(data ) => {
-                    println!("Human: {:?}, e:{:?} i:{:?}", data.transcript().trim(), data.event_id(), data.item_id());
+                    if let Err(e) = client_ctrl2.try_send(Input::InterruptionDetected()) {
+                        eprintln!("Failed to send interruption event: {:?}", e);
+                    }
                 }
                 openai_realtime::types::events::ServerEvent::ResponseAudioDelta(data) => {
                     if let Err(e) = post_tx.send(data.delta().to_string()).await {
                         eprintln!("Failed to send audio data to resampler: {:?}", e);
                     }
                 }
-                // openai_realtime::types::events::ServerEvent::ResponseTextDone(data) => {
-                //     println!("text: {:?}", data.text());
-                // }
-                openai_realtime::types::events::ServerEvent::ResponseCreated(data ) => {
-                    println!("response created: {:?}", data.response());
+                openai_realtime::types::events::ServerEvent::ConversationItemInputAudioTranscriptionCompleted(data) => {
+                    println!("Human: {:?}", data.transcript().trim());
                 }
                 openai_realtime::types::events::ServerEvent::ResponseAudioTranscriptDone(data) => {
                     println!("AI: {:?}", data.transcript());
-                }
-                // openai_realtime::types::events::ServerEvent::ResponseAudioDone(data ) => {
-                //     println!("audio done: {:?}", data);
-                // }
-                openai_realtime::types::events::ServerEvent::ResponseDone(data) => {
-                    println!("usage: {:?}", data.response().usage());
-                    println!("output: {:?}", data.response().outputs());
                 }
                 openai_realtime::types::events::ServerEvent::Close { reason } => {
                     println!("close: {:?}", reason);
@@ -266,10 +234,11 @@ async fn main() {
     )
     .expect("failed to create resampler for input");
 
-    // client_events for audio
     let client_handle = tokio::spawn(async move {
         let mut ai_speaking = false;
         let mut initialized = false;
+        let mut can_interrupt = true;
+        let mut last_interrupt_time = Instant::now();
         let mut buffer: VecDeque<f32> = VecDeque::with_capacity(INPUT_CHUNK_SIZE * 2);
 
         while let Some(i) = input_rx.recv().await {
@@ -282,6 +251,9 @@ async fn main() {
                         .with_input_audio_transcription_enable(
                             openai_realtime::types::audio::TranscriptionModel::Whisper,
                         )
+                        .with_turn_detection_enable(TurnDetection::ServerVad(
+                            ServerVadTurnDetection::default(),
+                        ))
                         .build();
                     println!(
                         "session config: {:?}",
@@ -294,18 +266,13 @@ async fn main() {
                 }
                 Input::Initialized() => {
                     println!("initialized");
-                    // let config = openai_realtime::types::Session::new()
-                    //     .with_modalities_enable_audio()
-                    //     .with_instructions("Please greeting in Japanese")
-                    //     .build();
-                    // realtime_api.create_response_with_config(config).await.expect("failed to send message");
                     initialized = true;
                 }
                 Input::AISpeaking() => {
                     if !ai_speaking {
                         println!("AI speaking...");
                     }
-                    buffer.clear();
+                    // buffer.clear();
                     ai_speaking = true;
                 }
                 Input::AISpeakingDone() => {
@@ -314,8 +281,23 @@ async fn main() {
                     }
                     ai_speaking = false;
                 }
+                Input::InterruptionDetected() => {
+                    println!("Interruption detected, AI speaking: {}", ai_speaking);
+                    if ai_speaking
+                        && can_interrupt
+                        && last_interrupt_time.elapsed().as_millis() > INTERRUPT_COOLDOWN_MS as u128
+                    {
+                        println!("Attempting to stop AI response...");
+                        realtime_api
+                            .stop_response()
+                            .await
+                            .expect("failed to stop response");
+                        last_interrupt_time = Instant::now();
+                        println!("AI response stopped");
+                    }
+                }
                 Input::Audio(audio) => {
-                    if initialized && !ai_speaking {
+                    if initialized {
                         for sample in audio {
                             buffer.push_back(sample);
                         }

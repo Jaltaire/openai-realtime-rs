@@ -233,6 +233,12 @@ impl Client {
         );
         self.send_client_event(event).await
     }
+
+    pub async fn stop_response(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let event =
+            types::ClientEvent::ResponseCancel(types::events::client::ResponseCancelEvent::new());
+        self.send_client_event(event).await
+    }
 }
 
 pub async fn connect_with_config(
